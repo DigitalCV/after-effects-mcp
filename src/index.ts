@@ -190,7 +190,14 @@ server.tool(
       "setCompositionProperties",
       "duplicateLayer",
       "deleteLayer",
-      "setLayerMask"
+      "setLayerMask",
+      "applyPreset",
+      "importFootage",
+      "addFootageLayer",
+      "setPropertyKeyframes",
+      "getLayerEffects",
+      "saveProject",
+      "runBatch"
     ];
     
     if (!allowedScripts.includes(script)) {
@@ -366,6 +373,13 @@ Available scripts:
 - setLayerExpression: Set an expression for a layer property
 - applyEffect: Apply an effect to a layer
 - applyEffectTemplate: Apply a predefined effect template to a layer
+- applyPreset: Apply an .ffx preset to a layer (presetPath, compName/compIndex, layerName/layerIndex, time)
+- importFootage: Import a file into the project, reusing it if already imported (filePath, name)
+- addFootageLayer: Add a footage item to a comp (compName, itemId/itemName, startTime, sourceTime, duration, name, position, scale, enabled, audioEnabled)
+- setPropertyKeyframes: Set keyframes on a property by match-name path (compName, layerName/layerIndex, propertyPath, keys: [[time, value], ...], clearExisting)
+- getLayerEffects: List a layer's effects and keyframed properties (compName, layerName/layerIndex, includeParams)
+- saveProject: Save the project (filePath for Save As)
+- runBatch: Run several commands in order in one undo group (commands: [{command, args}], stopOnError)
 
 Effect Templates:
 - gaussian-blur: Simple Gaussian blur effect
@@ -669,6 +683,45 @@ server.tool(
           {
             type: "text",
             text: `Error queuing apply-effect command: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+// Add a tool for applying .ffx animation presets to layers
+server.tool(
+  "apply-preset",
+  "Apply an .ffx animation preset to a layer in After Effects",
+  {
+    presetPath: z.string().describe("Absolute path to the .ffx preset file."),
+    compName: z.string().optional().describe("Name of the target composition (preferred over compIndex)."),
+    compIndex: z.number().int().positive().optional().describe("1-based project item index of the target composition."),
+    layerName: z.string().optional().describe("Name of the target layer."),
+    layerIndex: z.number().int().positive().optional().describe("1-based index of the target layer within the composition."),
+    time: z.number().optional().describe("Comp time in seconds where the preset's keyframes start (defaults to the layer's in point).")
+  },
+  async (parameters) => {
+    try {
+      clearResultsFile();
+      writeCommandFile("applyPreset", parameters);
+      const result = await waitForBridgeResult("applyPreset", 10000, 250);
+      return {
+        content: [
+          {
+            type: "text",
+            text: result
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error queuing apply-preset command: ${String(error)}`
           }
         ],
         isError: true

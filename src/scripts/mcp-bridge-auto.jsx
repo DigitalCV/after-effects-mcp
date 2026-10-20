@@ -883,18 +883,12 @@ function applyEffect(args) {
             throw new Error("You must specify either effectName, effectMatchName, or presetPath");
         }
         
-        // Find the composition by index
-        var comp = app.project.item(compIndex);
-        if (!comp || !(comp instanceof CompItem)) {
-            throw new Error("Composition not found at index " + compIndex);
-        }
-        
-        // Find the layer by index
-        var layer = comp.layer(layerIndex);
-        if (!layer) {
-            throw new Error("Layer not found at index " + layerIndex + " in composition '" + comp.name + "'");
-        }
-        
+        // Find the composition (by compName if given, else by index) and the layer
+        var comp = bridgeFindComp({ compName: args.compName, compIndex: compIndex });
+        var layer = bridgeFindLayer(comp, args.layerName && !args.layerIndex
+            ? { layerName: args.layerName } : { layerIndex: layerIndex });
+        layerIndex = layer.index;
+
         var effectResult;
         
         // Apply preset if a path is provided
@@ -1015,18 +1009,12 @@ function applyEffectTemplate(args) {
             throw new Error("You must specify a templateName");
         }
         
-        // Find the composition by index
-        var comp = app.project.item(compIndex);
-        if (!comp || !(comp instanceof CompItem)) {
-            throw new Error("Composition not found at index " + compIndex);
-        }
-        
-        // Find the layer by index
-        var layer = comp.layer(layerIndex);
-        if (!layer) {
-            throw new Error("Layer not found at index " + layerIndex + " in composition '" + comp.name + "'");
-        }
-        
+        // Find the composition (by compName if given, else by index) and the layer
+        var comp = bridgeFindComp({ compName: args.compName, compIndex: compIndex });
+        var layer = bridgeFindLayer(comp, args.layerName && !args.layerIndex
+            ? { layerName: args.layerName } : { layerIndex: layerIndex });
+        layerIndex = layer.index;
+
         // Template definitions
         var templates = {
             // Blur effects
@@ -1337,6 +1325,19 @@ function getResultFilePath() {
     return bridgeFolder.fsName + "/ae_mcp_result.json";
 }
 
+// ISO 8601 UTC timestamp - ExtendScript's Date has no toISOString()
+function isoTimestamp() {
+    function pad(n, width) {
+        var s = String(n);
+        while (s.length < width) { s = "0" + s; }
+        return s;
+    }
+    var d = new Date();
+    return d.getUTCFullYear() + "-" + pad(d.getUTCMonth() + 1, 2) + "-" + pad(d.getUTCDate(), 2) +
+        "T" + pad(d.getUTCHours(), 2) + ":" + pad(d.getUTCMinutes(), 2) + ":" + pad(d.getUTCSeconds(), 2) +
+        "." + pad(d.getUTCMilliseconds(), 3) + "Z";
+}
+
 // --- setCompositionProperties: set duration, frameRate, etc. on active or named comp ---
 function setCompositionProperties(args) {
     try {
@@ -1494,6 +1495,367 @@ function getLayerInfo() {
     return JSON.stringify(result, null, 2);
 }
 
+// --- Shared lookups for the commands below ---
+// Comp by name, else by project item index (default 1, like the older commands)
+function bridgeFindComp(args) {
+    if (args.compName) {
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var it = app.project.item(i);
+            if (it instanceof CompItem && it.name === args.compName) { return it; }
+        }
+        throw new Error("Composition not found: " + args.compName);
+    }
+    var comp = app.project.item(args.compIndex || 1);
+    if (!comp || !(comp instanceof CompItem)) {
+        throw new Error("Composition not found at index " + (args.compIndex || 1));
+    }
+    return comp;
+}
+
+function bridgeFindLayer(comp, args) {
+    var layer = null;
+    if (args.layerIndex) {
+        layer = comp.layer(args.layerIndex);
+    } else if (args.layerName) {
+        layer = comp.layer(args.layerName);
+    }
+    if (!layer) {
+        throw new Error("Layer not found (" + (args.layerIndex || args.layerName) + ") in composition '" + comp.name + "'");
+    }
+    return layer;
+}
+
+function bridgeFindItem(args) {
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var it = app.project.item(i);
+        if ((args.itemId && it.id === args.itemId) || (args.itemName && it.name === args.itemName)) { return it; }
+    }
+    throw new Error("Project item not found: " + (args.itemId || args.itemName));
+}
+
+// Every keyframed property under a property group, as {path, times}
+function bridgeCollectKeyframes(group, path, out) {
+    for (var i = 1; i <= group.numProperties; i++) {
+        var p = group.property(i);
+        var here = path + "/" + p.name;
+        if (p.propertyType === PropertyType.PROPERTY) {
+            if (p.numKeys > 0) {
+                var times = [];
+                for (var k = 1; k <= p.numKeys; k++) { times.push(Math.round(p.keyTime(k) * 1000) / 1000); }
+                out.push({ path: here, times: times });
+            }
+        } else {
+            bridgeCollectKeyframes(p, here, out);
+        }
+    }
+    return out;
+}
+
+// --- applyPreset: load an .ffx animation preset onto one layer ---
+// Layer.applyPreset applies to the comp's *selected* layers and drops keyframes at the
+// comp's current time, so select only the target layer and move the time indicator first.
+function applyPreset(args) {
+    try {
+        if (!args.presetPath) { throw new Error("presetPath is required"); }
+        var presetFile = new File(args.presetPath);
+        if (!presetFile.exists) { throw new Error("Preset file not found: " + args.presetPath); }
+        var comp = bridgeFindComp(args);
+        var layer = bridgeFindLayer(comp, args);
+        var before = layer.property("ADBE Effect Parade").numProperties;
+
+        comp.openInViewer();
+        var selected = comp.selectedLayers;
+        for (var i = 0; i < selected.length; i++) { selected[i].selected = false; }
+        layer.selected = true;
+        comp.time = (args.time !== undefined) ? args.time : layer.inPoint;
+        layer.applyPreset(presetFile);
+        layer.selected = false;
+
+        var fx = layer.property("ADBE Effect Parade");
+        var added = [];
+        for (var e = before + 1; e <= fx.numProperties; e++) {
+            added.push({ name: fx.property(e).name, matchName: fx.property(e).matchName, index: e });
+        }
+        return JSON.stringify({
+            status: "success",
+            message: "Preset applied",
+            preset: presetFile.displayName,
+            appliedAt: comp.time,
+            layer: { name: layer.name, index: layer.index },
+            effectsAdded: added,
+            keyframes: bridgeCollectKeyframes(layer, "", [])
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- importFootage: import a file once, reuse the item afterwards ---
+function importFootage(args) {
+    try {
+        var file = new File(args.filePath);
+        if (!file.exists) { throw new Error("File not found: " + args.filePath); }
+        var item = null;
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var it = app.project.item(i);
+            if (it instanceof FootageItem && it.file && it.file.fsName === file.fsName) { item = it; break; }
+        }
+        var reused = item !== null;
+        if (!item) {
+            item = app.project.importFile(new ImportOptions(file));
+            if (args.name) { item.name = args.name; }
+        }
+        return JSON.stringify({
+            status: "success",
+            reused: reused,
+            item: { id: item.id, name: item.name, duration: item.duration, width: item.width,
+                    height: item.height, frameRate: item.frameRate, hasAudio: item.hasAudio }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- addFootageLayer: place a clip at startTime (comp) showing the source from sourceTime ---
+function addFootageLayer(args) {
+    try {
+        var comp = bridgeFindComp(args);
+        var item = bridgeFindItem(args);
+        var layer = comp.layers.add(item);
+        var start = args.startTime || 0;
+        var sourceTime = args.sourceTime || 0;
+        layer.startTime = start - sourceTime;
+        layer.inPoint = start;
+        layer.outPoint = start + (args.duration !== undefined ? args.duration : item.duration - sourceTime);
+        if (args.name) { layer.name = args.name; }
+        if (args.position) { layer.property("ADBE Transform Group").property("ADBE Position").setValue(args.position); }
+        if (args.scale) { layer.property("ADBE Transform Group").property("ADBE Scale").setValue(args.scale); }
+        if (args.enabled !== undefined) { layer.enabled = args.enabled; }
+        if (args.audioEnabled !== undefined && layer.hasAudio) { layer.audioEnabled = args.audioEnabled; }
+        return JSON.stringify({
+            status: "success",
+            layer: { name: layer.name, index: layer.index, inPoint: layer.inPoint, outPoint: layer.outPoint, startTime: layer.startTime }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- setPropertyKeyframes: keys [[time, value], ...] on a property addressed by match names ---
+function setPropertyKeyframes(args) {
+    try {
+        var comp = bridgeFindComp(args);
+        var layer = bridgeFindLayer(comp, args);
+        var prop = layer;
+        for (var i = 0; i < args.propertyPath.length; i++) {
+            prop = prop.property(args.propertyPath[i]);
+            if (!prop) { throw new Error("Property not found: " + args.propertyPath.slice(0, i + 1).join(" > ")); }
+        }
+        // Presets leave keys at sub-frame times that setValueAtTime can't hit exactly; clear them to rewrite the curve
+        if (args.clearExisting) {
+            while (prop.numKeys > 0) { prop.removeKey(prop.numKeys); }
+        }
+        for (var k = 0; k < args.keys.length; k++) {
+            prop.setValueAtTime(args.keys[k][0], args.keys[k][1]);
+        }
+        return JSON.stringify({ status: "success", property: prop.name, numKeys: prop.numKeys, layer: layer.name }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- getLayerEffects: effects on a layer plus every keyframed property ---
+function getLayerEffects(args) {
+    try {
+        var comp = bridgeFindComp(args);
+        var layer = bridgeFindLayer(comp, args);
+        var fx = layer.property("ADBE Effect Parade");
+        var effects = [];
+        for (var e = 1; e <= fx.numProperties; e++) {
+            var eff = fx.property(e);
+            var params = [];
+            if (args.includeParams) {
+                for (var p = 1; p <= eff.numProperties; p++) {
+                    var prop = eff.property(p);
+                    if (prop.propertyType === PropertyType.PROPERTY && prop.propertyValueType !== PropertyValueType.NO_VALUE) {
+                        var v = null;
+                        try { v = prop.value; } catch (ignore) {}
+                        params.push({ name: prop.name, value: v });
+                    }
+                }
+            }
+            effects.push({ index: e, name: eff.name, matchName: eff.matchName, enabled: eff.enabled, params: params });
+        }
+        return JSON.stringify({
+            status: "success",
+            layer: { name: layer.name, index: layer.index, inPoint: layer.inPoint, outPoint: layer.outPoint },
+            effects: effects,
+            keyframes: bridgeCollectKeyframes(layer, "", [])
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- saveProject ---
+function saveProject(args) {
+    try {
+        if (args.filePath) {
+            app.project.save(new File(args.filePath));
+        } else {
+            app.project.save();
+        }
+        return JSON.stringify({ status: "success", path: app.project.file ? app.project.file.fsName : "" }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- runBatch: run several bridge commands in order, in one undo group ---
+function runBatch(args) {
+    var results = [];
+    var failed = 0;
+    var commands = args.commands || [];
+    app.beginUndoGroup("MCP batch");
+    try {
+        for (var i = 0; i < commands.length; i++) {
+            var c = commands[i];
+            if (c.command === "runBatch") { throw new Error("runBatch cannot be nested"); }
+            var raw = dispatchCommand(c.command, c.args || {});
+            var parsed;
+            try { parsed = JSON.parse(raw); } catch (e) { parsed = { raw: raw }; }
+            var ok = !(parsed && (parsed.status === "error" || parsed.success === false || parsed.error));
+            if (!ok) { failed++; }
+            results.push({ index: i, command: c.command, ok: ok, result: parsed });
+            if (!ok && args.stopOnError) { break; }
+        }
+    } finally {
+        app.endUndoGroup();
+    }
+    return JSON.stringify({ status: failed ? "partial" : "success", ran: results.length, failed: failed, results: results }, null, 2);
+}
+
+// Run one bridge command and return its JSON result string
+function dispatchCommand(command, args) {
+    var result = "";
+    // Use a switch statement for clarity
+    switch (command) {
+        case "getProjectInfo":
+            result = getProjectInfo();
+            break;
+        case "listCompositions":
+            result = listCompositions();
+            break;
+        case "getLayerInfo":
+            result = getLayerInfo();
+            break;
+        case "createComposition":
+            logToPanel("Calling createComposition function...");
+            result = createComposition(args);
+            logToPanel("Returned from createComposition.");
+            break;
+        case "createTextLayer":
+            logToPanel("Calling createTextLayer function...");
+            result = createTextLayer(args);
+            logToPanel("Returned from createTextLayer.");
+            break;
+        case "createShapeLayer":
+            logToPanel("Calling createShapeLayer function...");
+            result = createShapeLayer(args);
+            logToPanel("Returned from createShapeLayer. Result type: " + typeof result);
+            break;
+        case "createSolidLayer":
+            logToPanel("Calling createSolidLayer function...");
+            result = createSolidLayer(args);
+            logToPanel("Returned from createSolidLayer.");
+            break;
+        case "setLayerProperties":
+            logToPanel("Calling setLayerProperties function...");
+            result = setLayerProperties(args);
+            logToPanel("Returned from setLayerProperties.");
+            break;
+        case "setLayerKeyframe":
+            logToPanel("Calling setLayerKeyframe function...");
+            result = setLayerKeyframe(args.compIndex, args.layerIndex, args.propertyName, args.timeInSeconds, args.value);
+            logToPanel("Returned from setLayerKeyframe.");
+            break;
+        case "setLayerExpression":
+            logToPanel("Calling setLayerExpression function...");
+            result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
+            logToPanel("Returned from setLayerExpression.");
+            break;
+        case "applyEffect":
+            logToPanel("Calling applyEffect function...");
+            result = applyEffect(args);
+            logToPanel("Returned from applyEffect.");
+            break;
+        case "applyEffectTemplate":
+            logToPanel("Calling applyEffectTemplate function...");
+            result = applyEffectTemplate(args);
+            logToPanel("Returned from applyEffectTemplate.");
+            break;
+        case "bridgeTestEffects":
+            logToPanel("Calling bridgeTestEffects function...");
+            result = bridgeTestEffects(args);
+            logToPanel("Returned from bridgeTestEffects.");
+            break;
+        case "createCamera":
+            logToPanel("Calling createCamera function...");
+            result = createCamera(args);
+            logToPanel("Returned from createCamera.");
+            break;
+        case "batchSetLayerProperties":
+            logToPanel("Calling batchSetLayerProperties function...");
+            result = batchSetLayerProperties(args);
+            logToPanel("Returned from batchSetLayerProperties.");
+            break;
+        case "setCompositionProperties":
+            logToPanel("Calling setCompositionProperties function...");
+            result = setCompositionProperties(args);
+            logToPanel("Returned from setCompositionProperties.");
+            break;
+        case "duplicateLayer":
+            logToPanel("Calling duplicateLayer function...");
+            result = duplicateLayer(args);
+            logToPanel("Returned from duplicateLayer.");
+            break;
+        case "deleteLayer":
+            logToPanel("Calling deleteLayer function...");
+            result = deleteLayer(args);
+            logToPanel("Returned from deleteLayer.");
+            break;
+        case "setLayerMask":
+            logToPanel("Calling setLayerMask function...");
+            result = setLayerMask(args);
+            logToPanel("Returned from setLayerMask.");
+            break;
+        case "applyPreset":
+            result = applyPreset(args);
+            break;
+        case "importFootage":
+            result = importFootage(args);
+            break;
+        case "addFootageLayer":
+            result = addFootageLayer(args);
+            break;
+        case "setPropertyKeyframes":
+            result = setPropertyKeyframes(args);
+            break;
+        case "getLayerEffects":
+            result = getLayerEffects(args);
+            break;
+        case "saveProject":
+            result = saveProject(args);
+            break;
+        case "runBatch":
+            result = runBatch(args);
+            break;
+        default:
+            result = JSON.stringify({ error: "Unknown command: " + command });
+    }
+    return result;
+}
+
 // Execute command
 function executeCommand(command, args) {
     var result = "";
@@ -1504,100 +1866,7 @@ function executeCommand(command, args) {
 
     try {
         logToPanel("Attempting to execute: " + command); // Log before switch
-        // Use a switch statement for clarity
-        switch (command) {
-            case "getProjectInfo":
-                result = getProjectInfo();
-                break;
-            case "listCompositions":
-                result = listCompositions();
-                break;
-            case "getLayerInfo":
-                result = getLayerInfo();
-                break;
-            case "createComposition":
-                logToPanel("Calling createComposition function...");
-                result = createComposition(args);
-                logToPanel("Returned from createComposition.");
-                break;
-            case "createTextLayer":
-                logToPanel("Calling createTextLayer function...");
-                result = createTextLayer(args);
-                logToPanel("Returned from createTextLayer.");
-                break;
-            case "createShapeLayer":
-                logToPanel("Calling createShapeLayer function...");
-                result = createShapeLayer(args);
-                logToPanel("Returned from createShapeLayer. Result type: " + typeof result);
-                break;
-            case "createSolidLayer":
-                logToPanel("Calling createSolidLayer function...");
-                result = createSolidLayer(args);
-                logToPanel("Returned from createSolidLayer.");
-                break;
-            case "setLayerProperties":
-                logToPanel("Calling setLayerProperties function...");
-                result = setLayerProperties(args);
-                logToPanel("Returned from setLayerProperties.");
-                break;
-            case "setLayerKeyframe":
-                logToPanel("Calling setLayerKeyframe function...");
-                result = setLayerKeyframe(args.compIndex, args.layerIndex, args.propertyName, args.timeInSeconds, args.value);
-                logToPanel("Returned from setLayerKeyframe.");
-                break;
-            case "setLayerExpression":
-                logToPanel("Calling setLayerExpression function...");
-                result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
-                logToPanel("Returned from setLayerExpression.");
-                break;
-            case "applyEffect":
-                logToPanel("Calling applyEffect function...");
-                result = applyEffect(args);
-                logToPanel("Returned from applyEffect.");
-                break;
-            case "applyEffectTemplate":
-                logToPanel("Calling applyEffectTemplate function...");
-                result = applyEffectTemplate(args);
-                logToPanel("Returned from applyEffectTemplate.");
-                break;
-            case "bridgeTestEffects":
-                logToPanel("Calling bridgeTestEffects function...");
-                result = bridgeTestEffects(args);
-                logToPanel("Returned from bridgeTestEffects.");
-                break;
-            case "createCamera":
-                logToPanel("Calling createCamera function...");
-                result = createCamera(args);
-                logToPanel("Returned from createCamera.");
-                break;
-            case "batchSetLayerProperties":
-                logToPanel("Calling batchSetLayerProperties function...");
-                result = batchSetLayerProperties(args);
-                logToPanel("Returned from batchSetLayerProperties.");
-                break;
-            case "setCompositionProperties":
-                logToPanel("Calling setCompositionProperties function...");
-                result = setCompositionProperties(args);
-                logToPanel("Returned from setCompositionProperties.");
-                break;
-            case "duplicateLayer":
-                logToPanel("Calling duplicateLayer function...");
-                result = duplicateLayer(args);
-                logToPanel("Returned from duplicateLayer.");
-                break;
-            case "deleteLayer":
-                logToPanel("Calling deleteLayer function...");
-                result = deleteLayer(args);
-                logToPanel("Returned from deleteLayer.");
-                break;
-            case "setLayerMask":
-                logToPanel("Calling setLayerMask function...");
-                result = setLayerMask(args);
-                logToPanel("Returned from setLayerMask.");
-                break;
-            default:
-                result = JSON.stringify({ error: "Unknown command: " + command });
-        }
+        result = dispatchCommand(command, args);
         logToPanel("Execution finished for: " + command); // Log after switch
         
         // Save the result (ensure result is always a string)
@@ -1608,7 +1877,7 @@ function executeCommand(command, args) {
         try {
             var resultObj = JSON.parse(resultString);
             // Add a timestamp to help identify if we're getting fresh results
-            resultObj._responseTimestamp = new Date().toISOString();
+            resultObj._responseTimestamp = isoTimestamp();
             resultObj._commandExecuted = command;
             resultString = JSON.stringify(resultObj, null, 2);
             logToPanel("Added timestamp to result JSON for tracking freshness.");
@@ -1687,11 +1956,12 @@ function executeCommand(command, args) {
 function updateCommandStatus(status) {
     try {
         var commandFile = new File(getCommandFilePath());
+        commandFile.encoding = "UTF-8"; // the server writes UTF-8; the default codepage mangles non-ASCII text
         if (commandFile.exists) {
             commandFile.open("r");
             var content = commandFile.read();
             commandFile.close();
-            
+
             if (content) {
                 var commandData = JSON.parse(content);
                 commandData.status = status;
@@ -1720,11 +1990,12 @@ function checkForCommands() {
     
     try {
         var commandFile = new File(getCommandFilePath());
+        commandFile.encoding = "UTF-8"; // the server writes UTF-8; the default codepage mangles non-ASCII text
         if (commandFile.exists) {
             commandFile.open("r");
             var content = commandFile.read();
             commandFile.close();
-            
+
             if (content) {
                 var commandData = (typeof JSON !== "undefined" && JSON.parse)
                     ? JSON.parse(content)
